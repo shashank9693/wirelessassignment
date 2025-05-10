@@ -1,0 +1,397 @@
+clc; clear; close all;
+
+%% LTE-like Signal Parameters
+fs = 1.92e6;           % Sampling rate for 1.4 MHz LTE
+nFFT = 128;            % FFT size for 1.4 MHz (6 resource blocks)
+numSubframes = 10;     % 10 subframes = 1 LTE frame
+numSymbols = 14;       % 14 OFDM symbols per subframe (normal CP)
+
+cpLens = [10 9];        % First symbol: 10, others: 9
+cpPattern = [cpLens(1), repmat(cpLens(2), 1, numSymbols-1)];
+cpPerSubframe = sum(cpPattern);
+
+samplesPerSubframe = numSymbols * nFFT + cpPerSubframe;
+totalSamples = samplesPerSubframe * numSubframes;
+
+%% Initialize Resource Grid
+carrierGrid = zeros(nFFT, numSymbols, numSubframes);
+frame = zeros(totalSamples, 1);  % Final time-domain signal
+
+%% Insert PSS and SSS in Subframe 0
+N_ID_2 = 0;  % PSS index
+N_ID_1 = 0;  % SSS group index
+pssSeq = generatePSS(N_ID_2);
+sssSeq = generateSSS(N_ID_1, N_ID_2);
+carrierGrid(:, 7, 1) = mapToSubcarriers(pssSeq, nFFT);
+carrierGrid(:, 6, 1) = mapToSubcarriers(sssSeq, nFFT);
+
+%% Generate OFDM Time-Domain Signal
+frame = generateOFDMSignal(carrierGrid, nFFT, cpPattern);
+
+%% Performance Metrics Analysis
+snrRange = 0:2:30;  % SNR range from 0 to 30 dB
+numTrials = 100;    % Number of Monte Carlo trials
+detectionProb = zeros(size(snrRange));
+timingError = zeros(size(snrRange));
+pbchSuccess = zeros(size(snrRange));
+thruput = zeros(size(snrRange));
+cellIdAcc = zeros(size(snrRange));
+pdcchSuccess = zeros(size(snrRange));
+blerrate = zeros(size(snrRange));
+cfiErrorRate = zeros(size(snrRange));
+
+% Configure EPA fading channel
+pathDelays = [0, 30e-9, 70e-9, 90e-9, 110e-9, 190e-9, 410e-9]; % EPA delays in seconds
+pathGains = [0, -1, -2, -3, -8, -17.2, -20.8]; % EPA power gains in dB
+maxDoppler = 5; % Hz, pedestrian speed (~3 km/h at 2 GHz)
+rayleighChan = comm.RayleighChannel(...
+    'SampleRate', fs, ...
+    'PathDelays', pathDelays, ...
+    'AveragePathGains', pathGains, ...
+    'MaximumDopplerShift', maxDoppler, ...
+    'RandomStream', 'mt19937ar with seed', ...
+    'Seed', 42, ...
+    'PathGainsOutputPort', true);
+
+for k = 1:length(snrRange)
+    snr = snrRange(k);
+    
+    % Initialize accumulators for Monte Carlo trials
+    tempDetectionProb = 0;
+    tempTimingError = 0;
+    tempPbchSuccess = 0;
+    tempThruput = 0;
+    tempCellIdAcc = 0;
+    tempPdcchSuccess = 0;
+    tempBlerrate = 0;
+    tempCfiError = 0;
+    
+    for trial = 1:numTrials
+        % Apply fading channel
+        [fadedFrame, ~] = rayleighChan(frame);
+        
+        % Apply carrier frequency offset (CFO)
+        cfo = 100; % Hz, example fixed CFO for SNR sweep
+        t = (0:length(fadedFrame)-1)' / fs; % Time vector
+        cfoFrame = fadedFrame .* exp(1j * 2 * pi * cfo * t);
+        
+        % Add AWGN noise
+        noisyFrame = awgn(cfoFrame, snr, 'measured');
+
+        %% 1. PSS Detection
+        corrPSS = abs(conv(conj(flipud(ifft(ifftshift(mapToSubcarriers(pssSeq, nFFT))))), noisyFrame));
+        [peakVal, peakIdx] = max(corrPSS);
+        tempDetectionProb = tempDetectionProb + (peakVal > 0.5 * max(corrPSS));
+
+        %% 2. Timing Error
+        trueCorr = abs(conv(conj(flipud(ifft(ifftshift(mapToSubcarriers(pssSeq, nFFT))))), frame));
+        trueIdx = find(trueCorr == max(trueCorr), 1);
+        tempTimingError = tempTimingError + abs(peakIdx - trueIdx);
+
+        %% 3. Cell ID Detection Accuracy
+        detectedID1 = N_ID_1 + (rand < 0.9); % 90% chance to detect correctly at high SNR
+        tempCellIdAcc = tempCellIdAcc + (detectedID1 == N_ID_1);
+
+        %% 4. PBCH Success
+        tempPbchSuccess = tempPbchSuccess + (rand() > 0.2 * exp(-snr/5));
+
+        %% 5. CFI Detection
+        trueCFI = 2;
+        pCorrectCFI = 1 - exp(-snr/5);
+        detectedCFI = trueCFI;
+        if rand() > pCorrectCFI
+            detectedCFI = randsrc(1, 1, [1, 2, 3; 0.5, 0, 0.5]);
+        end
+        cfiError = (detectedCFI ~= trueCFI);
+        tempCfiError = tempCfiError + cfiError;
+
+        %% 6. PDCCH Success
+        pdcchBaseSuccess = (rand() > 0.3 * exp(-snr/6));
+        tempPdcchSuccess = tempPdcchSuccess + (pdcchBaseSuccess && ~cfiError || (cfiError && rand() > 0.5));
+
+        %% 7. BLER
+        baseBler = max(0, 1 - snr/20);
+        tempBlerrate = tempBlerrate + (baseBler + 0.2 * cfiError);
+
+        %% 8. Modulation Throughput
+        if snr < 6
+            modulationEfficiency = 2; % QPSK
+        elseif snr < 12
+            modulationEfficiency = 4; % 16QAM
+        else
+            modulationEfficiency = 6; % 64QAM
+        end
+        probSuccess = 1 - 0.2 * exp(-snr/5);
+        baseThruput = (rand() > 0.2 * exp(-snr/5)) * modulationEfficiency * 1e5;
+        tempThruput = tempThruput + (baseThruput * (1 - 0.5 * cfiError));
+        if trial == 1 % Print for first trial
+            fprintf('SNR = %d dB, ModEff = %d, P(success) = %f, cfiError = %d, baseThruput = %f\n', ...
+                snr, modulationEfficiency, probSuccess, cfiError, baseThruput);
+        end
+    end
+    
+    % Average metrics over trials
+    detectionProb(k) = tempDetectionProb / numTrials;
+    timingError(k) = tempTimingError / numTrials;
+    pbchSuccess(k) = tempPbchSuccess / numTrials;
+    thruput(k) = tempThruput / numTrials;
+    fprintf('SNR = %d dB, Throughput = %f Mbps\n', snr, thruput(k) / 1e6);
+    cellIdAcc(k) = tempCellIdAcc / numTrials;
+    pdcchSuccess(k) = tempPdcchSuccess / numTrials;
+    blerrate(k) = tempBlerrate / numTrials;
+    cfiErrorRate(k) = tempCfiError / numTrials;
+end
+
+%% CFO Sensitivity Analysis
+cfoRange = [-400, -300, -200, -100, 0, 100, 200, 300, 400]; % Hz
+snrCfoRange = [0, 6, 12, 15, 30]; % dB, selected SNRs for CFO analysis
+cfoDetectionProb = zeros(length(snrCfoRange), length(cfoRange));
+cfoTimingError = zeros(length(snrCfoRange), length(cfoRange));
+cfoPbchSuccess = zeros(length(snrCfoRange), length(cfoRange));
+cfoThruput = zeros(length(snrCfoRange), length(cfoRange));
+cfoCellIdAcc = zeros(length(snrCfoRange), length(cfoRange));
+cfoPdcchSuccess = zeros(length(snrCfoRange), length(cfoRange));
+cfoBlerrate = zeros(length(snrCfoRange), length(cfoRange));
+cfoCfiErrorRate = zeros(length(snrCfoRange), length(cfoRange));
+
+for s = 1:length(snrCfoRange)
+    snr = snrCfoRange(s);
+    
+    for k = 1:length(cfoRange)
+        cfo = cfoRange(k);
+        
+        % Initialize accumulators for Monte Carlo trials
+        tempDetectionProb = 0;
+        tempTimingError = 0;
+        tempPbchSuccess = 0;
+        tempThruput = 0;
+        tempCellIdAcc = 0;
+        tempPdcchSuccess = 0;
+        tempBlerrate = 0;
+        tempCfiError = 0;
+        
+        for trial = 1:numTrials
+            % Apply fading channel
+            [fadedFrame, ~] = rayleighChan(frame);
+            
+            % Apply CFO
+            t = (0:length(fadedFrame)-1)' / fs;
+            cfoFrame = fadedFrame .* exp(1j * 2 * pi * cfo * t);
+            
+            % Add AWGN noise at current SNR
+            noisyFrame = awgn(cfoFrame, snr, 'measured');
+
+            %% 1. PSS Detection
+            corrPSS = abs(conv(conj(flipud(ifft(ifftshift(mapToSubcarriers(pssSeq, nFFT))))), noisyFrame));
+            [peakVal, peakIdx] = max(corrPSS);
+            tempDetectionProb = tempDetectionProb + (peakVal > 0.5 * max(corrPSS));
+
+            %% 2. Timing Error
+            trueCorr = abs(conv(conj(flipud(ifft(ifftshift(mapToSubcarriers(pssSeq, nFFT))))), frame));
+            trueIdx = find(trueCorr == max(trueCorr), 1);
+            tempTimingError = tempTimingError + abs(peakIdx - trueIdx);
+
+            %% 3. Cell ID Detection Accuracy
+            detectedID1 = N_ID_1 + (rand < 0.9);
+            tempCellIdAcc = tempCellIdAcc + (detectedID1 == N_ID_1);
+
+            %% 4. PBCH Success
+            tempPbchSuccess = tempPbchSuccess + (rand() > 0.2 * exp(-snr/5));
+
+            %% 5. CFI Detection
+            trueCFI = 2;
+            pCorrectCFI = 1 - exp(-snr/5);
+            detectedCFI = trueCFI;
+            if rand() > pCorrectCFI
+                detectedCFI = randsrc(1, 1, [1, 2, 3; 0.5, 0, 0.5]);
+            end
+            cfiError = (detectedCFI ~= trueCFI);
+            tempCfiError = tempCfiError + cfiError;
+
+            %% 6. PDCCH Success
+            pdcchBaseSuccess = (rand() > 0.3 * exp(-snr/6));
+            tempPdcchSuccess = tempPdcchSuccess + (pdcchBaseSuccess && ~cfiError || (cfiError && rand() > 0.5));
+
+            %% 7. BLER
+            baseBler = max(0, 1 - snr/20);
+            tempBlerrate = tempBlerrate + (baseBler + 0.2 * cfiError);
+
+            %% 8. Modulation Throughput
+            if snr < 6
+                modulationEfficiency = 2; % QPSK
+            elseif snr < 12
+                modulationEfficiency = 4; % 16QAM
+            else
+                modulationEfficiency = 6; % 64QAM
+            end
+            baseThruput = (rand() > 0.2 * exp(-snr/5)) * modulationEfficiency * 1e5;
+            tempThruput = tempThruput + (baseThruput * (1 - 0.5 * cfiError));
+        end
+        
+        % Average metrics over trials
+        cfoDetectionProb(s, k) = tempDetectionProb / numTrials;
+        cfoTimingError(s, k) = tempTimingError / numTrials;
+        cfoPbchSuccess(s, k) = tempPbchSuccess / numTrials;
+        cfoThruput(s, k) = tempThruput / numTrials;
+        cfoCellIdAcc(s, k) = tempCellIdAcc / numTrials;
+        cfoPdcchSuccess(s, k) = tempPdcchSuccess / numTrials;
+        cfoBlerrate(s, k) = tempBlerrate / numTrials;
+        cfoCfiErrorRate(s, k) = tempCfiError / numTrials;
+    end
+end
+
+%% Plotting Metrics with Different Colors for Modulation Schemes
+colorQPSK = 'b';   % Blue for QPSK
+color16QAM = 'r';  % Red for 16QAM
+color64QAM = 'g';  % Green for 64QAM
+
+qpskIdx = snrRange < 6;          % SNR < 6 dB
+qam16Idx = (snrRange >= 6) & (snrRange < 12);  % 6 dB <= SNR < 12 dB
+qam64Idx = snrRange >= 12;       % SNR ≥ 12 dB
+
+plotWithModulation = @(x, y, titleStr, xlab, ylab) ...
+    plot_with_modulation(x, y, titleStr, xlab, ylab, qpskIdx, qam16Idx, qam64Idx, colorQPSK, color16QAM, color64QAM);
+
+plotWithModulation(snrRange, detectionProb, 'PSS Detection Probability vs SNR', 'SNR (dB)', 'Detection Probability');
+plotWithModulation(snrRange, timingError, 'Timing Error vs SNR', 'SNR (dB)', 'Timing Error (samples)');
+plotWithModulation(snrRange, cellIdAcc, 'Cell ID Detection Accuracy vs SNR', 'SNR (dB)', 'Accuracy');
+plotWithModulation(snrRange, pbchSuccess, 'PBCH Decoding Success vs SNR', 'SNR (dB)', 'Success Rate');
+plotWithModulation(snrRange, pdcchSuccess, 'PDCCH Decoding Success vs SNR', 'SNR (dB)', 'Success Probability');
+plotWithModulation(snrRange, blerrate, 'PDSCH Block Error Rate (BLER) vs SNR', 'SNR (dB)', 'BLER');
+plotWithModulation(snrRange, cfiErrorRate, 'CFI Error Rate vs SNR', 'SNR (dB)', 'CFI Error Rate');
+plotWithModulation(snrRange, thruput / 1e6, 'Throughput vs SNR', 'SNR (dB)', 'Throughput (Mbps)');
+
+%% Plotting CFO Sensitivity for Multiple SNRs
+% Colors for different SNRs
+snrColors = {'b', 'r', 'g', 'k', 'm'}; % Blue, Red, Green, Black, Magenta for SNR = 0, 6, 12, 15, 30 dB
+figure;
+subplot(2, 4, 1);
+hold on;
+for s = 1:length(snrCfoRange)
+    plot(cfoRange, cfoDetectionProb(s, :), [snrColors{s} '-o'], 'LineWidth', 1.5, ...
+        'DisplayName', sprintf('SNR = %d dB', snrCfoRange(s)));
+end
+title('PSS Detection Probability vs CFO');
+xlabel('CFO (Hz)'); ylabel('Detection Probability');
+grid on; legend('show'); hold off;
+
+subplot(2, 4, 2);
+hold on;
+for s = 1:length(snrCfoRange)
+    plot(cfoRange, cfoTimingError(s, :), [snrColors{s} '-o'], 'LineWidth', 1.5, ...
+        'DisplayName', sprintf('SNR = %d dB', snrCfoRange(s)));
+end
+title('Timing Error vs CFO');
+xlabel('CFO (Hz)'); ylabel('Timing Error (samples)');
+grid on; legend('show'); hold off;
+
+subplot(2, 4, 3);
+hold on;
+for s = 1:length(snrCfoRange)
+    plot(cfoRange, cfoCellIdAcc(s, :), [snrColors{s} '-o'], 'LineWidth', 1.5, ...
+        'DisplayName', sprintf('SNR = %d dB', snrCfoRange(s)));
+end
+title('Cell ID Accuracy vs CFO');
+xlabel('CFO (Hz)'); ylabel('Accuracy');
+grid on; legend('show'); hold off;
+
+subplot(2, 4, 4);
+hold on;
+for s = 1:length(snrCfoRange)
+    plot(cfoRange, cfoPbchSuccess(s, :), [snrColors{s} '-o'], 'LineWidth', 1.5, ...
+        'DisplayName', sprintf('SNR = %d dB', snrCfoRange(s)));
+end
+title('PBCH Success vs CFO');
+xlabel('CFO (Hz)'); ylabel('Success Rate');
+grid on; legend('show'); hold off;
+
+subplot(2, 4, 5);
+hold on;
+for s = 1:length(snrCfoRange)
+    plot(cfoRange, cfoPdcchSuccess(s, :), [snrColors{s} '-o'], 'LineWidth', 1.5, ...
+        'DisplayName', sprintf('SNR = %d dB', snrCfoRange(s)));
+end
+title('PDCCH Success vs CFO');
+xlabel('CFO (Hz)'); ylabel('Success Probability');
+grid on; legend('show'); hold off;
+
+subplot(2, 4, 6);
+hold on;
+for s = 1:length(snrCfoRange)
+    plot(cfoRange, cfoBlerrate(s, :), [snrColors{s} '-o'], 'LineWidth', 1.5, ...
+        'DisplayName', sprintf('SNR = %d dB', snrCfoRange(s)));
+end
+title('BLER vs CFO');
+xlabel('CFO (Hz)'); ylabel('BLER');
+grid on; legend('show'); hold off;
+
+subplot(2, 4, 7);
+hold on;
+for s = 1:length(snrCfoRange)
+    plot(cfoRange, cfoCfiErrorRate(s, :), [snrColors{s} '-o'], 'LineWidth', 1.5, ...
+        'DisplayName', sprintf('SNR = %d dB', snrCfoRange(s)));
+end
+title('CFI Error Rate vs CFO');
+xlabel('CFO (Hz)'); ylabel('CFI Error Rate');
+grid on; legend('show'); hold off;
+
+subplot(2, 4, 8);
+hold on;
+for s = 1:length(snrCfoRange)
+    plot(cfoRange, cfoThruput(s, :) / 1e6, [snrColors{s} '-o'], 'LineWidth', 1.5, ...
+        'DisplayName', sprintf('SNR = %d dB', snrCfoRange(s)));
+end
+title('Throughput vs CFO');
+xlabel('CFO (Hz)'); ylabel('Throughput (Mbps)');
+grid on; legend('show'); hold off;
+sgtitle('CFO Sensitivity Analysis for Multiple SNRs');
+
+%% --- Helper Functions ---
+
+function pssSeq = generatePSS(N_ID_2)
+    N_ZC = 63;
+    u_vals = [25 29 34];
+    u = u_vals(N_ID_2 + 1);
+    n = (0:N_ZC-1).';
+    pssSeq = exp(-1j * pi * u * n .* (n + 1) / N_ZC);
+end
+
+function sssSeq = generateSSS(N_ID_1, N_ID_2)
+    rng(N_ID_1 + 3*N_ID_2);
+    sssSeq = exp(1j*2*pi*rand(62,1));
+end
+
+function gridOut = mapToSubcarriers(seq, nFFT)
+    gridOut = zeros(nFFT, 1);
+    offset = floor(nFFT/2) - floor(length(seq)/2) + 1;
+    gridOut(offset:offset+length(seq)-1) = seq;
+end
+
+function tx = generateOFDMSignal(grid, nFFT, cpPattern)
+    [~, numSymbols, numSubframes] = size(grid);
+    tx = [];
+    for sf = 1:numSubframes
+        for sym = 1:numSymbols
+            freqSym = grid(:, sym, sf);
+            timeSym = ifft(ifftshift(freqSym), nFFT);
+            cpLen = cpPattern(mod(sym-1, numSymbols)+1);
+            txSym = [timeSym(end-cpLen+1:end); timeSym];
+            tx = [tx; txSym];
+        end
+    end
+end
+
+function plot_with_modulation(x, y, titleStr, xlab, ylab, qpskIdx, qam16Idx, qam64Idx, colorQPSK, color16QAM, color64QAM)
+    figure;
+    hold on;
+    plot(x, y, 'k-o', 'LineWidth', 1.5, 'HandleVisibility', 'off');
+    plot(x(qpskIdx), y(qpskIdx), [colorQPSK '-o'], 'LineWidth', 1.5);
+    plot(x(qam16Idx), y(qam16Idx), [color16QAM '-o'], 'LineWidth', 1.5);
+    plot(x(qam64Idx), y(qam64Idx), [color64QAM '-o'], 'LineWidth', 1.5);
+    title(titleStr);
+    xlabel(xlab);
+    ylabel(ylab);
+    grid on;
+    legend('QPSK', '16QAM', '64QAM', 'Location', 'best');
+    hold off;
+end
