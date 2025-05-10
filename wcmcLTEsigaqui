@@ -1,0 +1,583 @@
+%% LTE Simulation with PSS, SSS, CRS, and Channel Decoding
+clear all; close all; clc;
+
+%% Parameters
+% LTE Parameters
+bandwidth = 1.4e6;          % Bandwidth in Hz
+Nrb = 6;                    % Number of resource blocks (1.4 MHz)
+Nsc = 12;                   % Subcarriers per RB
+Nfft = 128;                 % FFT size (for 1.4 MHz)
+Ncp = 9;                    % Cyclic prefix length (~4.7 us)
+numSymbols = 14;            % OFDM symbols per subframe (2 slots)
+Fs = 1.92e6;                % Sampling rate
+subframeDuration = 1e-3;    % 1 ms
+Nsubcarriers = Nrb * Nsc;   % Total subcarriers (72)
+numPdschSubcarriers = 12;   % Subcarriers used for PDSCH decoding
+SNR_dB_range = 0:5:20;      % SNR range for evaluation
+useFading = true;           % Enable multipath fading
+cfoValues = [0, 100, 500]; % CFO in Hz for sensitivity analysis
+modSchemes = {'QPSK', '16QAM', '64QAM'}; % Modulation schemes
+bitsPerSymbol = [2, 4, 6]; % Bits per symbol for each scheme
+
+% Cell ID Parameters
+N_ID_2 = 0;                 % PSS index (0, 1, or 2)
+N_ID_1 = 0;                 % SSS index (0 to 167)
+PCI = 3 * N_ID_1 + N_ID_2;  % Physical Cell Identity
+truePssStart = 5 * (Nfft + Ncp) + 1; % True PSS start (~686)
+
+%% Generate PSS (Zadoff-Chu Sequence)
+u = [25, 29, 34];          % Root indices for PSS (N_ID_2 = 0, 1, 2)
+pssLen = 62;                % PSS sequence length
+pssSeq = zeros(pssLen, 1);
+for n = 0:pssLen-1
+    pssSeq(n+1) = exp(-1i * pi * u(N_ID_2+1) * n * (n+1) / 63);
+end
+pssGrid = zeros(Nsubcarriers, 1);
+pssGrid(6:67) = pssSeq;     % Center 62 subcarriers
+
+%% Generate Time-Domain PSS
+pssFreq = zeros(Nfft, 1);
+startIdx = (Nfft - Nsubcarriers) / 2 + 1; % = 29
+pssFreq(startIdx:startIdx+Nsubcarriers-1) = pssGrid;
+pssTime = ifft(pssFreq, Nfft);
+pssTimeCP = [pssTime(end-Ncp+1:end); pssTime];
+
+%% Generate SSS
+if ~isnumeric(N_ID_1) || ~isnumeric(N_ID_2) || N_ID_1 < 0 || N_ID_1 > 167 || N_ID_2 < 0 || N_ID_2 > 2
+    error('Invalid N_ID_1 or N_ID_2 values');
+end
+sssSeq = generate_SSS(N_ID_1, N_ID_2);
+sssGrid = zeros(Nsubcarriers, 1);
+sssGrid(6:36) = sssSeq;
+sssGrid(37:67) = sssSeq;
+
+%% Generate Time-Domain SSS
+sssFreq = zeros(Nfft, 1);
+sssFreq(startIdx:startIdx+Nsubcarriers-1) = sssGrid;
+sssTime = ifft(sssFreq, Nfft);
+sssTimeCP = [sssTime(end-Ncp+1:end); sssTime];
+
+%% Initialize Results Storage
+numTrials = 100;
+pssProb = zeros(length(SNR_dB_range), length(modSchemes));
+sssProb = zeros(length(SNR_dB_range), length(modSchemes));
+cellIdAcc = zeros(length(SNR_dB_range), length(modSchemes));
+timingError = zeros(length(SNR_dB_range), length(modSchemes));
+mibSuccess = zeros(length(SNR_dB_range), length(modSchemes));
+pdcchBlindSuccess = zeros(length(SNR_dB_range), length(modSchemes));
+pdschBler = zeros(length(SNR_dB_range), length(modSchemes));
+throughput = zeros(length(SNR_dB_range), length(modSchemes));
+cfoTimingError = zeros(length(cfoValues), length(modSchemes));
+cfoPssProb = zeros(length(cfoValues), length(modSchemes));
+cfiErrorRate = zeros(length(SNR_dB_range), length(modSchemes));
+mseLinear = zeros(length(SNR_dB_range), length(modSchemes));
+mseMmse = zeros(length(SNR_dB_range), length(modSchemes));
+
+for modIdx = 1:length(modSchemes)
+    modScheme = modSchemes{modIdx};
+    bitsPerSym = bitsPerSymbol(modIdx);
+
+    %% Generate CRS (Simplified)
+    crsSeq = (randi([0 1], Nsubcarriers, 1) * 2 - 1) / sqrt(2);
+    crsPos = [1, 5, 8, 12];
+
+    %% Generate Resource Grid (1 subframe)
+    resourceGrid = zeros(Nsubcarriers, numSymbols);
+    resourceGrid(:, 7) = pssGrid; % PSS (symbol 6)
+    resourceGrid(:, 6) = sssGrid; % SSS (symbol 5)
+    for sym = crsPos
+        resourceGrid(:, sym+1) = crsSeq;
+    end
+    % PBCH (symbols 7-10)
+    mibBits = zeros(24, 1);
+    mibBits(1:8) = decimalToBinary(100, 8)'; % SFN = 100
+    mibBits(9) = 0; % PHICH duration
+    mibBits(10:11) = decimalToBinary(1, 2)'; % PHICH resource
+    mibBits(12:14) = decimalToBinary(2, 3)'; % Bandwidth config
+    pbchBits = repmat(mibBits, ceil(Nsubcarriers*4*2/24), 1); % 576 bits for 288 QPSK symbols
+    pbchBits = pbchBits(1:Nsubcarriers*4*2);
+    pbchData = modulateData(pbchBits, 'QPSK');
+    pbchGrid = reshape(pbchData, Nsubcarriers, 4);
+    resourceGrid(:, 8:11) = pbchGrid;
+    % PDSCH (symbols 1-5, excluding control)
+    pdschBits = randi([0 1], numPdschSubcarriers*5*bitsPerSym, 1);
+    pdschData = modulateData(pdschBits, modScheme);
+    pdschGrid = reshape(pdschData, numPdschSubcarriers, 5);
+    resourceGrid(1:numPdschSubcarriers, 1:5) = pdschGrid;
+
+    %% OFDM Modulation
+    txSubframe = zeros(Nfft + Ncp, numSymbols);
+    for sym = 1:numSymbols
+        freqSym = zeros(Nfft, 1);
+        freqSym(startIdx:startIdx+Nsubcarriers-1) = resourceGrid(:, sym);
+        timeSym = ifft(freqSym, Nfft);
+        txSubframe(:, sym) = [timeSym(end-Ncp+1:end); timeSym];
+    end
+    txFrame = txSubframe(:);
+    txWithOffset = txFrame;
+
+    for snrIdx = 1:length(SNR_dB_range)
+        SNR_dB = SNR_dB_range(snrIdx);
+        noisePower = 10^(-SNR_dB/10);
+        EbNo = SNR_dB - 10*log10(bitsPerSym);
+
+        pssSuccess = 0;
+        sssSuccess = 0;
+        cellIdSuccess = 0;
+        timingErrSum = 0;
+        mibSuccessCount = 0;
+        pdcchBlindSuccessCount = 0;
+        pdschBlockErrors = 0;
+        throughputSum = 0;
+        cfiErrors = 0;
+        mseLinearSum = 0;
+        mseMmseSum = 0;
+
+        for trial = 1:numTrials
+            %% Channel Model
+            noise = sqrt(noisePower/2) * (randn(size(txFrame)) + 1i * randn(size(txFrame)));
+            rxFrame = txWithOffset + noise;
+            if useFading
+                tau = [0 1e-6];
+                pdb = [0 -3];
+                fading = zeros(size(txFrame));
+                for tap = 1:length(tau)
+                    gain = 10^(pdb(tap)/20) * (randn(size(txFrame)) + 1i * randn(size(txFrame))) / sqrt(2);
+                    delaySamples = round(tau(tap) * Fs);
+                    fading = fading + [zeros(delaySamples, 1); gain(1:end-delaySamples)];
+                end
+                rxFrame = conv(txFrame, fading, 'same') + noise;
+            end
+
+            %% CFO Estimation
+            cfoCorr = 0;
+            numSyms = floor(length(rxFrame) / (Nfft + Ncp));
+            for sym = 1:numSyms
+                startIdx = (sym-1) * (Nfft + Ncp) + 1;
+                cp = rxFrame(startIdx:startIdx+Ncp-1);
+                tail = rxFrame(startIdx+Nfft:startIdx+Nfft+Ncp-1);
+                cfoCorr = cfoCorr + sum(conj(cp) .* tail);
+            end
+            cfoEst = angle(cfoCorr) / (2 * pi * Nfft / Fs);
+            t = (0:length(rxFrame)-1)' / Fs;
+            rxFrame = rxFrame .* exp(-1i * 2 * pi * cfoEst * t);
+
+            %% PSS Detection
+            correlationLength = length(rxFrame) - length(pssTimeCP) + 1;
+            correlation = zeros(correlationLength, 1);
+            for i = 1:correlationLength
+                segment = rxFrame(i:i+length(pssTimeCP)-1);
+                if length(segment) == length(pssTimeCP)
+                    correlation(i) = abs(sum(conj(pssTimeCP) .* segment));
+                end
+            end
+            expectedPssStart = 5 * (Nfft + Ncp) + 1;
+            searchWindow = 100;
+            corrStart = max(1, expectedPssStart - searchWindow);
+            corrEnd = min(correlationLength, expectedPssStart + searchWindow);
+            correlation(corrStart:corrEnd) = abs(correlation(corrStart:corrEnd));
+            correlation(1:corrStart-1) = 0;
+            correlation(corrEnd+1:end) = 0;
+            [peakVal, peakPos] = max(correlation);
+            maxSyncStart = length(rxFrame) - (numSymbols-6) * (Nfft + Ncp) - Ncp - Nfft + 1;
+            if peakPos > maxSyncStart
+                peakPos = maxSyncStart;
+            end
+            syncStart = peakPos;
+            if abs(syncStart - truePssStart) < 5
+                pssSuccess = pssSuccess + 1;
+            end
+            timingErrSum = timingErrSum + abs(syncStart - truePssStart);
+
+            %% SSS Detection
+            sssCorr = zeros(3, 1);
+            for i = 1:3
+                sssTest = generate_SSS(N_ID_1, i-1);
+                sssTestGrid = zeros(Nsubcarriers, 1);
+                sssTestGrid(6:36) = sssTest;
+                sssTestGrid(37:67) = sssTest;
+                sssFreq = zeros(Nfft, 1);
+                sssFreq(startIdx:startIdx+Nsubcarriers-1) = sssTestGrid;
+                sssTestTime = ifft(sssFreq, Nfft);
+                sssTestTimeCP = [sssTestTime(end-Ncp+1:end); sssTestTime];
+                sssSegmentStart = syncStart - (Nfft + Ncp);
+                if sssSegmentStart > 0
+                    sssSegment = rxFrame(sssSegmentStart:sssSegmentStart+length(pssTimeCP)-1);
+                    if length(sssSegment) == length(sssTestTimeCP)
+                        sssCorr(i) = abs(sum(conj(sssTestTimeCP) .* sssSegment));
+                    end
+                end
+            end
+            [~, detected_N_ID_2] = max(sssCorr);
+            detected_N_ID_2 = detected_N_ID_2 - 1;
+            NidCell = 3 * N_ID_1 + detected_N_ID_2;
+            if detected_N_ID_2 == N_ID_2
+                sssSuccess = sssSuccess + 1;
+            end
+            if NidCell == PCI
+                cellIdSuccess = cellIdSuccess + 1;
+            end
+
+            %% OFDM Demodulation
+            rxGrid = zeros(Nsubcarriers, numSymbols);
+            for sym = 1:numSymbols
+                startIdx = syncStart + (sym-6) * (Nfft + Ncp);
+                if startIdx+Ncp >= 1 && startIdx+Ncp+Nfft-1 <= length(rxFrame)
+                    rxSymbol = rxFrame(startIdx+Ncp:startIdx+Ncp+Nfft-1);
+                    rxFFT = fft(rxSymbol, Nfft);
+                    rxGrid(:, sym) = rxFFT((Nfft-Nsubcarriers)/2+1:(Nfft+Nsubcarriers)/2);
+                end
+            end
+
+            %% Channel Estimation
+            H_est = zeros(Nsubcarriers, numSymbols);
+            for sym = crsPos
+                H_est(:, sym+1) = rxGrid(:, sym+1) ./ crsSeq;
+            end
+            for sc = 1:Nsubcarriers
+                H_est(sc, :) = interp1(crsPos+1, H_est(sc, crsPos+1), 1:numSymbols, 'linear', 'extrap');
+            end
+            % MMSE Estimation
+            H_mmse = mmseChannelEstimation(rxGrid, crsSeq, crsPos, noisePower);
+            % Compute MSE
+            H_true = ones(Nsubcarriers, numSymbols); % Simplified true channel
+            mseLinearSum = mseLinearSum + mean(abs(H_est(:) - H_true(:)).^2);
+            mseMmseSum = mseMmseSum + mean(abs(H_mmse(:) - H_true(:)).^2);
+
+            %% PCFICH Decoding
+            pcfichREs = 1:16;
+            pcfichSymbols = rxGrid(pcfichREs, 1) ./ H_est(pcfichREs, 1);
+            pcfichBits = zeros(32, 1);
+            for k = 1:16
+                pcfichBits(2*k-1) = real(pcfichSymbols(k)) < 0;
+                pcfichBits(2*k) = imag(pcfichSymbols(k)) < 0;
+            end
+            controlFormat = binaryToDecimal(pcfichBits(1:2)') + 1;
+            trueCFI = 2; % Assume CFI=2
+            if controlFormat ~= trueCFI
+                cfiErrors = cfiErrors + 1;
+            end
+
+            %% PDCCH Blind Decoding (Simplified)
+            pdcchSymbols = rxGrid(1:12, 2:4) ./ H_est(1:12, 2:4);
+            pdcchBits = zeros(144, 1);
+            for sym = 1:3
+                for subcarrier = 1:12
+                    idx = (sym-1)*12 + subcarrier;
+                    pdcchBits(2*idx-1) = real(pdcchSymbols(subcarrier, sym)) < 0;
+                    pdcchBits(2*idx) = imag(pdcchSymbols(subcarrier, sym)) < 0;
+                end
+            end
+            % Simulate blind decoding: assume correct DCI format if bits match pattern
+            if sum(abs(pdcchBits - randi([0 1], 144, 1))) < 10 % Simplified threshold
+                pdcchBlindSuccessCount = pdcchBlindSuccessCount + 1;
+            end
+
+            %% PBCH Decoding
+            pbchRx = rxGrid(:, 8:11) ./ H_est(:, 8:11);
+            pbchRx = pbchRx(:);
+            pbchBitsRx = real(pbchRx) < 0;
+            if length(pbchBitsRx) >= 24
+                mibBitsRx = pbchBitsRx(1:24);
+                crc = crc24(mibBitsRx);
+                if all(crc == 0)
+                    mibSuccessCount = mibSuccessCount + 1;
+                end
+            end
+
+            %% PDSCH Decoding
+            pdschSymbols = rxGrid(1:numPdschSubcarriers, 1:5) ./ H_est(1:numPdschSubcarriers, 1:5);
+            pdschBitsRx = demodulateData(pdschSymbols(:), modScheme);
+            blockSize = numPdschSubcarriers * 5 * bitsPerSym;
+            blockErrors = 0; % Initialize to avoid undefined variable
+            if length(pdschBitsRx) >= blockSize
+                blockErrors = sum(pdschBitsRx(1:blockSize) ~= pdschBits(1:blockSize));
+                if blockErrors > 0
+                    pdschBlockErrors = pdschBlockErrors + 1;
+                end
+            end
+            throughputSum = throughputSum + (blockSize - blockErrors) / subframeDuration;
+        end
+
+        pssProb(snrIdx, modIdx) = pssSuccess / numTrials;
+        sssProb(snrIdx, modIdx) = sssSuccess / numTrials;
+        cellIdAcc(snrIdx, modIdx) = cellIdSuccess / numTrials;
+        timingError(snrIdx, modIdx) = timingErrSum / numTrials;
+        mibSuccess(snrIdx, modIdx) = mibSuccessCount / numTrials;
+        pdcchBlindSuccess(snrIdx, modIdx) = pdcchBlindSuccessCount / numTrials;
+        pdschBler(snrIdx, modIdx) = pdschBlockErrors / numTrials;
+        throughput(snrIdx, modIdx) = throughputSum / numTrials;
+        cfiErrorRate(snrIdx, modIdx) = cfiErrors / numTrials;
+        mseLinear(snrIdx, modIdx) = mseLinearSum / numTrials;
+        mseMmse(snrIdx, modIdx) = mseMmseSum / numTrials;
+    end
+
+    %% CFO Sensitivity Analysis
+    for cfoIdx = 1:length(cfoValues)
+        cfoHz = cfoValues(cfoIdx);
+        pssSuccess = 0;
+        timingErrSum = 0;
+        for trial = 1:numTrials
+            rxFrame = txWithOffset .* exp(1i * 2 * pi * cfoHz * t);
+            noise = sqrt(noisePower/2) * (randn(size(txFrame)) + 1i * randn(size(txFrame)));
+            rxFrame = rxFrame + noise;
+            correlation = zeros(correlationLength, 1);
+            for i = 1:correlationLength
+                segment = rxFrame(i:i+length(pssTimeCP)-1);
+                if length(segment) == length(pssTimeCP)
+                    correlation(i) = abs(sum(conj(pssTimeCP) .* segment));
+                end
+            end
+            [~, peakPos] = max(correlation);
+            if abs(peakPos - truePssStart) < 5
+                pssSuccess = pssSuccess + 1;
+            end
+            timingErrSum = timingErrSum + abs(peakPos - truePssStart);
+        end
+        cfoPssProb(cfoIdx, modIdx) = pssSuccess / numTrials;
+        cfoTimingError(cfoIdx, modIdx) = timingErrSum / numTrials;
+    end
+end
+
+%% Plotting and Analysis
+% PSS/SSS Detection Probability
+figure;
+for modIdx = 1:length(modSchemes)
+    subplot(length(modSchemes), 1, modIdx);
+    plot(SNR_dB_range, pssProb(:, modIdx), '-o', 'DisplayName', 'PSS');
+    hold on;
+    plot(SNR_dB_range, sssProb(:, modIdx), '-s', 'DisplayName', 'SSS');
+    title(['Detection Probability vs. SNR (' modSchemes{modIdx} ')']);
+    xlabel('SNR (dB)'); ylabel('Probability');
+    legend; grid on;
+end
+
+% Cell ID Detection Accuracy
+figure;
+for modIdx = 1:length(modSchemes)
+    plot(SNR_dB_range, cellIdAcc(:, modIdx), '-o', 'DisplayName', modSchemes{modIdx});
+    hold on;
+end
+title('Cell ID Detection Accuracy vs. SNR');
+xlabel('SNR (dB)'); ylabel('Accuracy'); legend; grid on;
+
+% Timing Synchronization Error
+figure;
+for modIdx = 1:length(modSchemes)
+    plot(SNR_dB_range, timingError(:, modIdx), '-o', 'DisplayName', modSchemes{modIdx});
+    hold on;
+end
+title('Timing Synchronization Error vs. SNR');
+xlabel('SNR (dB)'); ylabel('Error (Samples)'); legend; grid on;
+
+% MIB/PBCH Success Rate
+figure;
+for modIdx = 1:length(modSchemes)
+    plot(SNR_dB_range, mibSuccess(:, modIdx), '-o', 'DisplayName', modSchemes{modIdx});
+    hold on;
+end
+title('MIB/PBCH Decoding Success Rate vs. SNR');
+xlabel('SNR (dB)'); ylabel('Success Rate'); legend; grid on;
+
+% PDCCH Blind Decoding Success
+figure;
+for modIdx = 1:length(modSchemes)
+    plot(SNR_dB_range, pdcchBlindSuccess(:, modIdx), '-o', 'DisplayName', modSchemes{modIdx});
+    hold on;
+end
+title('PDCCH Blind Decoding Success Probability vs. SNR');
+xlabel('SNR (dB)'); ylabel('Success Probability'); legend; grid on;
+
+% PDSCH BLER
+figure;
+for modIdx = 1:length(modSchemes)
+    plot(SNR_dB_range, pdschBler(:, modIdx), '-o', 'DisplayName', modSchemes{modIdx});
+    hold on;
+end
+title('PDSCH Block Error Rate vs. SNR');
+xlabel('SNR (dB)'); ylabel('BLER'); legend; grid on;
+
+% Throughput
+figure;
+for modIdx = 1:length(modSchemes)
+    plot(SNR_dB_range, throughput(:, modIdx)/1e6, '-o', 'DisplayName', modSchemes{modIdx});
+    hold on;
+end
+title('Throughput vs. SNR');
+xlabel('SNR (dB)'); ylabel('Throughput (Mbps)'); legend; grid on;
+
+% CFI Error Rate
+figure;
+for modIdx = 1:length(modSchemes)
+    plot(SNR_dB_range, cfiErrorRate(:, modIdx), '-o', 'DisplayName', modSchemes{modIdx});
+    hold on;
+end
+title('CFI Detection Error Rate vs. SNR');
+xlabel('SNR (dB)'); ylabel('Error Rate'); legend; grid on;
+
+% Channel Estimation MSE
+figure;
+for modIdx = 1:length(modSchemes)
+    subplot(length(modSchemes), 1, modIdx);
+    plot(SNR_dB_range, mseLinear(:, modIdx), '-o', 'DisplayName', 'Linear');
+    hold on;
+    plot(SNR_dB_range, mseMmse(:, modIdx), '-s', 'DisplayName', 'MMSE');
+    title(['Channel Estimation MSE vs. SNR (' modSchemes{modIdx} ')']);
+    xlabel('SNR (dB)'); ylabel('MSE'); legend; grid on;
+end
+
+% CFO Sensitivity
+figure;
+subplot(2,1,1);
+for modIdx = 1:length(modSchemes)
+    plot(cfoValues, cfoPssProb(:, modIdx), '-o', 'DisplayName', modSchemes{modIdx});
+    hold on;
+end
+title('PSS Detection Probability vs. CFO');
+xlabel('CFO (Hz)'); ylabel('Probability'); legend; grid on;
+subplot(2,1,2);
+for modIdx = 1:length(modSchemes)
+    plot(cfoValues, cfoTimingError(:, modIdx), '-o', 'DisplayName', modSchemes{modIdx});
+    hold on;
+end
+title('Timing Synchronization Error vs. CFO');
+xlabel('CFO (Hz)'); ylabel('Error (Samples)'); legend; grid on;
+
+% PSS Correlation Peaks (for last trial)
+figure; plot(correlation); hold on; plot(peakPos, peakVal, 'ro');
+title('PSS Correlation Detection');
+xlabel('Sample Index'); ylabel('Correlation Magnitude'); legend('Correlation', 'Peak');
+
+%% Function: generate_SSS
+function sss = generate_SSS(N_ID_1, N_ID_2)
+    seq_length = 31;
+    q_prime = floor(N_ID_1 / 30);
+    q = floor((N_ID_1 + q_prime * (q_prime + 1) / 2) / 30);
+    m_prime = N_ID_1 + q * (q + 1) / 2;
+    m0 = mod(m_prime, seq_length);
+    m1 = mod(m0 + floor(m_prime / seq_length) + 1, seq_length);
+    x = zeros(1, seq_length);
+    x(1:5) = [0 0 0 0 1];
+    for n = 6:seq_length
+        x(n) = mod(x(n-4) + x(n-5), 2);
+    end
+    indices_s0 = mod((0:seq_length-1) + m0, seq_length) + 1;
+    indices_s1 = mod((0:seq_length-1) + m1, seq_length) + 1;
+    s0 = 1 - 2 * x(indices_s0);
+    s1 = 1 - 2 * x(indices_s1);
+    y = zeros(1, seq_length);
+    y(1:5) = [0 0 0 0 1];
+    for n = 6:seq_length
+        y(n) = mod(y(n-3) + y(n-5), 2);
+    end
+    indices_c0 = mod((0:seq_length-1) + N_ID_2, seq_length) + 1;
+    indices_c1 = mod((0:seq_length-1) + N_ID_2 + 3, seq_length) + 1;
+    c0 = 1 - 2 * y(indices_c0);
+    c1 = 1 - 2 * y(indices_c1);
+    sss = zeros(1, seq_length);
+    even_indices = 1:2:seq_length;
+    odd_indices = 2:2:seq_length-1;
+    sss(even_indices) = s0(even_indices) .* c0(even_indices);
+    sss(odd_indices) = s1(odd_indices) .* c1(odd_indices);
+end
+
+%% Function: crc24
+function crc = crc24(data)
+    crcPoly = [1 1 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 1 1 0 0 1 1];
+    reg = zeros(1, 24);
+    for i = 1:length(data)
+        reg = [reg(2:end) data(i)];
+        if reg(1) == 1
+            reg = mod(reg + crcPoly, 2);
+        end
+    end
+    crc = reg;
+end
+
+%% Function: binaryToDecimal
+function dec = binaryToDecimal(bin)
+    dec = 0;
+    for i = 1:length(bin)
+        dec = dec + bin(i) * 2^(length(bin)-i);
+    end
+end
+
+%% Function: decimalToBinary
+function bin = decimalToBinary(dec, numBits)
+    bin = zeros(numBits, 1);
+    for i = 1:numBits
+        bin(i) = bitand(bitshift(dec, -(numBits-i)), 1);
+    end
+end
+
+%% Function: modulateData
+function symbols = modulateData(bits, modScheme)
+    if strcmp(modScheme, 'QPSK')
+        bits = reshape(bits, 2, []);
+        symbols = (1 - 2*bits(1,:)) / sqrt(2) + 1i * (1 - 2*bits(2,:)) / sqrt(2);
+    elseif strcmp(modScheme, '16QAM')
+        bits = reshape(bits, 4, []);
+        % Map 2 bits to I/Q components: 00->-3, 01->-1, 11->+1, 10->+3
+        I = (2 * bits(1,:) - 1) .* (2 * (1 - bits(2,:)) + 1); % b0b1
+        Q = (2 * bits(3,:) - 1) .* (2 * (1 - bits(4,:)) + 1); % b2b3
+        symbols = (I + 1i * Q) / sqrt(10); % Normalize to unit average power
+    elseif strcmp(modScheme, '64QAM')
+        bits = reshape(bits, 6, []);
+        % Map 3 bits to I/Q: 000->-7, 001->-5, 011->-3, 010->-1, 110->+1, 111->+3, 101->+5, 100->+7
+        I = (4 * (1 - bits(2,:)) + 2 * (1 - bits(3,:)) + 1) .* (2 * bits(1,:) - 1); % b0b1b2
+        Q = (4 * (1 - bits(5,:)) + 2 * (1 - bits(6,:)) + 1) .* (2 * bits(4,:) - 1); % b3b4b5
+        symbols = (I + 1i * Q) / sqrt(42); % Normalize to unit average power
+    end
+    symbols = symbols(:);
+end
+
+%% Function: demodulateData
+function bits = demodulateData(symbols, modScheme)
+    if strcmp(modScheme, 'QPSK')
+        bits = zeros(2*length(symbols), 1);
+        bits(1:2:end) = real(symbols) < 0;
+        bits(2:2:end) = imag(symbols) < 0;
+    elseif strcmp(modScheme, '16QAM')
+        symbols = symbols * sqrt(10); % Undo normalization
+        bits = zeros(4*length(symbols), 1);
+        % I/Q decision boundaries: -2, 0, +2
+        I = real(symbols); Q = imag(symbols);
+        % b0: sign of I (0 if I>0, 1 if I<0)
+        bits(1:4:end) = I < 0;
+        % b1: |I| > 2 (0 if |I|>2, 1 if |I|<2)
+        bits(2:4:end) = abs(I) < 2;
+        % b2: sign of Q
+        bits(3:4:end) = Q < 0;
+        % b3: |Q| > 2
+        bits(4:4:end) = abs(Q) < 2;
+    elseif strcmp(modScheme, '64QAM')
+        symbols = symbols * sqrt(42); % Undo normalization
+        bits = zeros(6*length(symbols), 1);
+        % I/Q decision boundaries: -6, -4, -2, 0, +2, +4, +6
+        I = real(symbols); Q = imag(symbols);
+        % b0: sign of I
+        bits(1:6:end) = I < 0;
+        % b1: |I| > 4
+        bits(2:6:end) = abs(I) < 4;
+        % b2: |I| > 2 if |I|<4, or |I|>6 if |I|>4
+        bits(3:6:end) = (abs(I) < 4 & abs(I) > 2) | (abs(I) > 6);
+        % b3: sign of Q
+        bits(4:6:end) = Q < 0;
+        % b4: |Q| > 4
+        bits(5:6:end) = abs(Q) < 4;
+        % b5: |Q| > 2 if |Q|<4, or |Q|>6 if |Q|>4
+        bits(6:6:end) = (abs(Q) < 4 & abs(Q) > 2) | (abs(Q) > 6);
+    end
+end
+
+%% Function: mmseChannelEstimation
+function H_mmse = mmseChannelEstimation(rxGrid, crsSeq, crsPos, noisePower)
+    H_mmse = zeros(size(rxGrid));
+    for sym = crsPos
+        H_mmse(:, sym+1) = rxGrid(:, sym+1) ./ crsSeq;
+    end
+    for sc = 1:size(rxGrid, 1)
+        H_mmse(sc, :) = interp1(crsPos+1, H_mmse(sc, crsPos+1), 1:size(rxGrid, 2), 'linear', 'extrap');
+        H_mmse(sc, :) = H_mmse(sc, :) / (1 + noisePower);
+    end
+end
